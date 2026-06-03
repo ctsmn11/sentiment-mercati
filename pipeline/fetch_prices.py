@@ -19,6 +19,13 @@ import yfinance as yf
 
 from utils import DATASET_START, all_tickers, load_tickers_config, ticker_data_dir
 
+# Su Windows la console di default è cp1252 e va in errore sui caratteri non
+# ASCII (→, ⚠) usati nei log; su CI lo stdout è già UTF-8 e questo è un no-op.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, ValueError):
+    pass
+
 TICKER_ALIASES = {
     "^VWCE": "VWCE.AS",
 }
