@@ -11,7 +11,6 @@ frontend/public/data/
 
 # Pipeline data — gestito da GitHub Actions
 pipeline/data/
-pipeline/tickers_pending.json
 
 # Secrets
 backend/.env

@@ -1,22 +1,34 @@
 """
-classify_news.py — raccoglie notizie da Alpha Vantage per topic
+classify_news.py — raccoglie notizie + sentiment da Alpha Vantage per ticker
 
-Per ogni topic in topics.json:
-  - Scarica articoli dal giorno successivo all'ultima raccolta fino a ieri
-  - Dedup per URL — un articolo multi-topic viene salvato una volta sola
-  - Salva tutto in data/news.json con metadata di ultima raccolta per topic
+Per ogni ticker in tickers.json (costituenti + indice di mercato):
+  - Scarica articoli dal giorno successivo all'ultima raccolta fino a ieri,
+    in finestre da 30 giorni, UNA chiamata API per finestra.
+  - Dedup per URL — un articolo che cita piu' ticker viene salvato una volta
+    sola; il suo array `all_tickers` contiene comunque il sentiment per ognuno.
+  - Avanza il checkpoint `last_updated[ticker]` dopo OGNI finestra completata,
+    cosi' ogni chiamata produce progresso permanente: niente lavoro perso e
+    niente deadlock se il budget giornaliero (25 call) finisce a meta'.
+
+I ticker vengono processati in ordine di staleness (i piu' indietro per primi),
+cosi' su piu' run il backlog si svuota a rotazione rientrando nel budget free.
+
+Una finestra che supera FEED_CAP articoli viene troncata (limite reale dell'API,
+non un bug): si raccolgono i primi 1000 e si avanza comunque il checkpoint. Per
+un singolo ticker la saturazione e' rara — accade sui topic, non sui ticker.
 
 Struttura data/news.json:
   {
-    "last_updated": { "technology": "2026-06-02", ... },
+    "last_updated": { "AAPL": "2026-06-02", ... },
     "articles": [ { "date", "headline", "summary", "source", "url",
-                    "overall_sentiment", "topics", "all_tickers" }, ... ]
+                    "overall_sentiment", "overall_label", "topics",
+                    "all_tickers" }, ... ]
   }
 
 Usage:
-    python classify_news.py                          # tutti i topic in rotazione
-    python classify_news.py --topic technology       # singolo topic
-    python classify_news.py --from 2026-01-01        # backfill da data specifica
+    python classify_news.py                      # tutti i ticker, a rotazione
+    python classify_news.py --ticker AAPL        # singolo ticker
+    python classify_news.py --from 2026-01-01    # backfill da data specifica
 """
 
 import argparse
@@ -30,8 +42,15 @@ import requests
 from dotenv import load_dotenv
 
 from utils import (
-    DATASET_START, DATA_DIR, NEWS_F, load_topics_config
+    DATASET_START, DATA_DIR, NEWS_F, all_tickers, load_tickers_config
 )
+
+# Su Windows la console di default è cp1252 e va in errore sui caratteri non
+# ASCII (→, ⚠) usati nei log; su CI lo stdout è già UTF-8 e questo è un no-op.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, ValueError):
+    pass
 
 load_dotenv()
 AV_KEY = os.getenv("ALPHAVANTAGE_KEY")
@@ -40,6 +59,11 @@ WINDOW_DAYS   = 30
 API_CALLS_MAX = 25
 FEED_CAP      = 1000  # max articoli che l'API restituisce per finestra
 
+# Simbolo usato da Alpha Vantage NEWS_SENTIMENT, quando diverge dal nostro.
+# L'indice S&P 500 non e' un ticker di news: usiamo SPY (l'ETF che lo replica)
+# come proxy del "sentiment di mercato".
+NEWS_TICKER_ALIASES = {"^GSPC": "SPY"}
+
 
 class APIError(Exception):
     """Errore generico restituito dall'API Alpha Vantage."""
@@ -47,6 +71,10 @@ class APIError(Exception):
 
 class RateLimit(APIError):
     """Budget giornaliero esaurito — fermarsi e salvare il progresso."""
+
+
+def to_av_symbol(ticker: str) -> str:
+    return NEWS_TICKER_ALIASES.get(ticker, ticker)
 
 
 # --- funzioni di I/O ---
@@ -69,8 +97,8 @@ def save_news_db(db: dict):
     os.replace(tmp, NEWS_F)
 
 
-def last_collected_date(topic: str, db: dict) -> date:
-    d = db["last_updated"].get(topic)
+def last_collected_date(ticker: str, db: dict) -> date:
+    d = db["last_updated"].get(ticker)
     return date.fromisoformat(d) if d else DATASET_START - timedelta(days=1)
 
 
@@ -93,12 +121,12 @@ def av_label(score: float) -> str:
     return "neutral"
 
 
-def fetch_window(topic: str, time_from: str, time_to: str) -> list[dict]:
+def fetch_window(symbol: str, time_from: str, time_to: str) -> list[dict]:
     resp = requests.get(
         "https://www.alphavantage.co/query",
         params={
             "function":  "NEWS_SENTIMENT",
-            "topics":    topic,
+            "tickers":   symbol,
             "time_from": time_from,
             "time_to":   time_to,
             "limit":     1000,
@@ -155,48 +183,39 @@ def parse_article(item: dict) -> dict:
     }
 
 
-def fetch_window_complete(topic: str, w_start: date, w_end: date) -> tuple[list[dict], int]:
-    """Scarica una finestra. Se satura il cap (FEED_CAP articoli) la divide a
-    metà e ricorre, così non si perdono articoli oltre il limite dell'API.
-    La ricorsione si ferma al singolo giorno: se un giorno satura il cap il
-    troncamento è un limite reale dell'API, non un bug nostro.
-    Restituisce (articoli, chiamate_API_usate)."""
-    tf = w_start.strftime("%Y%m%d") + "T0000"
-    tt = w_end.strftime("%Y%m%d")   + "T2359"
-    feed  = fetch_window(topic, tf, tt)
-    calls = 1
-
-    if len(feed) >= FEED_CAP and w_start < w_end:
-        mid = w_start + (w_end - w_start) // 2
-        print(f"\n    ↳ cap {FEED_CAP} su {w_start}→{w_end}, divido", end="", flush=True)
-        time.sleep(1.2)
-        left,  lc = fetch_window_complete(topic, w_start, mid)
-        time.sleep(1.2)
-        right, rc = fetch_window_complete(topic, mid + timedelta(days=1), w_end)
-        return left + right, calls + lc + rc
-
-    if len(feed) >= FEED_CAP:
-        print(f"  ⚠ {w_start} satura il cap {FEED_CAP} — possibile troncamento", end="")
-    return feed, calls
-
-
-def collect_topic(topic: str, start: date, end: date, seen_urls: set, db: dict) -> int:
-    """Raccoglie articoli per un topic, scrivendo in `db` finestra per finestra.
-    `last_updated[topic]` avanza solo dopo che una finestra è stata scaricata
-    interamente: se la raccolta si interrompe (rate limit, rete), il progresso
-    già committato in `db` è coerente e ripartirà senza buchi né sovrapposizioni.
-    Restituisce il numero di chiamate API usate."""
+def collect_ticker(ticker: str, start: date, end: date, seen_urls: set,
+                   db: dict, budget: int) -> int:
+    """Raccoglie articoli per un ticker, una chiamata per finestra da 30 giorni.
+    Scrive in `db` finestra per finestra e avanza `last_updated[ticker]` solo
+    dopo ogni finestra completata: se il run si interrompe (rate limit, budget
+    finito) il progresso è coerente e riparte senza buchi né sovrapposizioni.
+    Non spende più di `budget` chiamate. Restituisce le chiamate effettuate."""
+    symbol  = to_av_symbol(ticker)
     windows = build_windows(start, end)
-    print(f"\n[{topic}] {start} → {end} | {len(windows)} finestre")
+    label   = ticker if symbol == ticker else f"{ticker} (→{symbol})"
+    print(f"\n[{label}] {start} → {end} | {len(windows)} finestre | budget {budget}")
 
     calls_used = 0
-    added = 0
+    added      = 0
     for i, (w_start, w_end) in enumerate(windows, 1):
-        if i > 1:
-            time.sleep(1.2)
+        if calls_used >= budget:
+            print(f"  budget del run esaurito — finestre rimanenti al prossimo run")
+            break
+        time.sleep(1.2)  # rispetta il rate limit (~1 req/s)
+        tf = w_start.strftime("%Y%m%d") + "T0000"
+        tt = w_end.strftime("%Y%m%d")   + "T2359"
         print(f"  [{i}/{len(windows)}] {w_start} → {w_end}", end="", flush=True)
-        feed, calls = fetch_window_complete(topic, w_start, w_end)
-        calls_used += calls
+        try:
+            feed = fetch_window(symbol, tf, tt)
+        except RateLimit:
+            raise  # propaga: l'intero run si ferma e salva (gestito in main)
+        except APIError as e:
+            # "Error Message" = ticker non valido o richiesta rifiutata. Non
+            # blocchiamo il ticker per sempre: trattiamo come 0 articoli e
+            # avanziamo comunque il checkpoint oltre questa finestra.
+            print(f"  ⚠ API error: {e}")
+            feed = []
+        calls_used += 1
         print(f"  {len(feed)} art")
 
         for item in feed:
@@ -208,10 +227,13 @@ def collect_topic(topic: str, start: date, end: date, seen_urls: set, db: dict) 
             db["articles"].append(parse_article(item))
             added += 1
 
-        # Finestra completata: avanza il checkpoint del topic.
-        db["last_updated"][topic] = w_end.isoformat()
+        if len(feed) >= FEED_CAP:
+            print(f"  ⚠ {w_start}→{w_end} satura il cap {FEED_CAP} — articoli oltre il limite non raccolti")
 
-    print(f"  → {added} nuovi articoli")
+        # Finestra completata: avanza il checkpoint del ticker.
+        db["last_updated"][ticker] = w_end.isoformat()
+
+    print(f"  → {added} nuovi articoli, {calls_used} call")
     return calls_used
 
 
@@ -219,7 +241,7 @@ def collect_topic(topic: str, start: date, end: date, seen_urls: set, db: dict) 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--topic", help="Singolo topic (override rotazione)")
+    parser.add_argument("--ticker", help="Singolo ticker (override rotazione)")
     parser.add_argument("--from",  dest="from_date", help="Data inizio backfill (YYYY-MM-DD)")
     args = parser.parse_args()
 
@@ -227,44 +249,40 @@ def main():
         print("ERRORE: ALPHAVANTAGE_KEY non trovata in .env o environment")
         sys.exit(1)
 
-    config  = load_topics_config()
-    topics  = [args.topic] if args.topic else config["topics"]
+    config  = load_tickers_config()
+    tickers = [args.ticker] if args.ticker else all_tickers(config)
     end     = date.today() - timedelta(days=1)
 
     db        = load_news_db()
     seen_urls = {a["url"] for a in db["articles"]}
 
-    # Ordina per staleness — topic più indietro vengono processati per primi
-    if not args.topic:
-        topics = sorted(topics, key=lambda t: last_collected_date(t, db))
+    # Ordina per staleness — i ticker più indietro vengono processati per primi,
+    # così su run successivi il backlog si svuota a rotazione.
+    if not args.ticker:
+        tickers = sorted(tickers, key=lambda t: last_collected_date(t, db))
 
     calls_used = 0
-    for topic in topics:
+    for ticker in tickers:
         if calls_used >= API_CALLS_MAX:
-            print(f"\nBudget esaurito ({API_CALLS_MAX} call). Topic rimanenti rinviati al prossimo run.")
+            print(f"\nBudget esaurito ({API_CALLS_MAX} call). Ticker rimanenti rinviati al prossimo run.")
             break
 
-        start = date.fromisoformat(args.from_date) if args.from_date else last_collected_date(topic, db) + timedelta(days=1)
+        start = date.fromisoformat(args.from_date) if args.from_date else last_collected_date(ticker, db) + timedelta(days=1)
 
         if start > end:
-            print(f"\n[{topic}] già aggiornato, skip.")
-            continue
-
-        calls_needed = len(build_windows(start, end))
-        if calls_used + calls_needed > API_CALLS_MAX:
-            print(f"\n[{topic}] richiederebbe {calls_needed} call, ne restano {API_CALLS_MAX - calls_used}. Skip.")
+            print(f"\n[{ticker}] già aggiornato, skip.")
             continue
 
         try:
-            calls_used += collect_topic(topic, start, end, seen_urls, db)
+            calls_used += collect_ticker(ticker, start, end, seen_urls, db, API_CALLS_MAX - calls_used)
         except RateLimit as e:
-            # collect_topic ha già committato in `db` le finestre completate:
-            # salviamo e ci fermiamo senza perdere il lavoro fatto finora.
+            # collect_ticker ha già committato in `db` le finestre completate:
+            # ci fermiamo senza perdere il lavoro fatto finora (salva il finally).
             print(f"\nRATE LIMIT: {e}")
             print("Salvo il progresso e mi fermo — il resto al prossimo run.")
             break
         finally:
-            # Persisti dopo ogni topic così un crash non vanifica il budget speso.
+            # Persisti dopo ogni ticker così un crash non vanifica il budget speso.
             db["articles"].sort(key=lambda x: x["date"])
             save_news_db(db)
 
