@@ -1,0 +1,17 @@
+{
+  "version": "1.0.0",
+  "updated": "2026-01-01",
+  "market_index": "^GSPC",
+  "tickers": [
+    "NVDA", "AAPL", "MSFT", "AMZN", "AVGO",
+    "GOOGL", "META", "MU", "TSLA", "BRK.B",
+    "AMD", "LLY", "JPM", "XOM", "JNJ",
+    "V", "INTC", "CSCO", "WMT", "COST",
+    "CAT", "LRCX", "ORCL", "AMAT", "MA",
+    "ABBV", "NFLX", "CVX", "BAC", "PLTR",
+    "UNH", "GE", "PG", "GS", "HD",
+    "IBM", "KO", "MRK", "TXN", "PM",
+    "KLAC", "GEV", "MS", "QCOM", "SNDK",
+    "WFC", "PANW", "RTX", "LIN", "DELL"
+  ]
+}

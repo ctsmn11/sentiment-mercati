@@ -1,0 +1,29 @@
+# Dipendenze
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Dati generati (eseguire il pipeline per rigenerarli)
+backend/data/
+frontend/public/data/
+
+# Pipeline data — gestito da GitHub Actions
+pipeline/data/
+pipeline/tickers_pending.json
+
+# Secrets
+backend/.env
+pipeline/.env
+
+# Build frontend
+frontend/dist/
+
+# Claude Code internal
+.claude/
+
+# Editor
+.vscode/
+.idea/
+*.swp
