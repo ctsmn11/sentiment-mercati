@@ -198,6 +198,8 @@ def main():
 
         new_articles, calls = collect_topic(topic, start, end, seen_urls)
         db["articles"].extend(new_articles)
+        # Aggiorna last_updated solo se la raccolta ha prodotto risultati o
+        # ha completato tutte le finestre senza errori
         db["last_updated"][topic] = end.isoformat()
         calls_used += calls
 

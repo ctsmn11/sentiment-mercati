@@ -38,6 +38,6 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add pipeline/data/news.json pipeline/data/*/prices.json pipeline/tickers.json 2>/dev/null || true
+          git add -f pipeline/data/news.json pipeline/data/*/prices.json pipeline/tickers.json 2>/dev/null || true
           git diff --cached --quiet || git commit -m "data: daily update $(date -u +%Y-%m-%d)"
           git push

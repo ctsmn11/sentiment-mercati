@@ -96,7 +96,7 @@ def main():
 
     for ticker in tickers_to_run:
         existing = load_existing_prices(ticker)
-        start    = date.fromisoformat(max(p["date"] for p in existing)) + timedelta(days=1) if existing else DATASET_START
+        start    = date.fromisoformat(existing[-1]["date"]) + timedelta(days=1) if existing else DATASET_START
 
         if start > end:
             print(f"[{ticker}] prezzi già aggiornati, skip.")
