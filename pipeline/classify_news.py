@@ -13,9 +13,9 @@ Per ogni ticker in tickers.json (costituenti + indice di mercato):
 I ticker vengono processati in ordine di staleness (i piu' indietro per primi),
 cosi' su piu' run il backlog si svuota a rotazione rientrando nel budget free.
 
-Una finestra che supera FEED_CAP articoli viene troncata (limite reale dell'API,
-non un bug): si raccolgono i primi 1000 e si avanza comunque il checkpoint. Per
-un singolo ticker la saturazione e' rara — accade sui topic, non sui ticker.
+Se una finestra supera FEED_CAP articoli, l'API restituisce i primi 1000 (sort=EARLIEST
+= i più vecchi). Il checkpoint avanza solo fino all'ultima data trovata nel feed,
+così il run successivo riparte da lì e non salta gli articoli intermedi.
 
 Struttura data/news.json:
   {
@@ -228,10 +228,16 @@ def collect_ticker(ticker: str, start: date, end: date, seen_urls: set,
             added += 1
 
         if len(feed) >= FEED_CAP:
-            print(f"  ⚠ {w_start}→{w_end} satura il cap {FEED_CAP} — articoli oltre il limite non raccolti")
+            # Feed troncato: avanziamo solo fino all'ultima data trovata nel feed,
+            # così il prossimo run riparte da lì senza saltare gli articoli intermedi.
+            raw_last = max(item.get("time_published", "19700101") for item in feed)
+            checkpoint = date(int(raw_last[:4]), int(raw_last[4:6]), int(raw_last[6:8]))
+            print(f"  ⚠ cap {FEED_CAP} raggiunto — checkpoint a {checkpoint} (non a {w_end})")
+        else:
+            checkpoint = w_end
 
         # Finestra completata: avanza il checkpoint del ticker.
-        db["last_updated"][ticker] = w_end.isoformat()
+        db["last_updated"][ticker] = checkpoint.isoformat()
 
     print(f"  → {added} nuovi articoli, {calls_used} call")
     return calls_used
