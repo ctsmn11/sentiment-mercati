@@ -38,6 +38,15 @@ AV_KEY = os.getenv("ALPHAVANTAGE_KEY")
 
 WINDOW_DAYS   = 30
 API_CALLS_MAX = 25
+FEED_CAP      = 1000  # max articoli che l'API restituisce per finestra
+
+
+class APIError(Exception):
+    """Errore generico restituito dall'API Alpha Vantage."""
+
+
+class RateLimit(APIError):
+    """Budget giornaliero esaurito — fermarsi e salvare il progresso."""
 
 
 # --- funzioni di I/O ---
@@ -51,8 +60,13 @@ def load_news_db() -> dict:
 
 def save_news_db(db: dict):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with open(NEWS_F, "w", encoding="utf-8") as f:
+    # Scrittura atomica: scrivo su un file temporaneo e poi lo rinomino.
+    # Se il processo viene ucciso a metà scrittura (timeout CI, OOM) il file
+    # definitivo resta intatto e non viene committato un JSON troncato.
+    tmp = NEWS_F.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, NEWS_F)
 
 
 def last_collected_date(topic: str, db: dict) -> date:
@@ -61,6 +75,15 @@ def last_collected_date(topic: str, db: dict) -> date:
 
 
 # --- funzioni API ---
+
+def to_float(x, default: float = 0.0) -> float:
+    """Converte in float tollerando None e stringhe vuote/non numeriche.
+    L'API a volte restituisce null al posto di uno score: float(None) fallirebbe."""
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
 
 def av_label(score: float) -> str:
     if score > 0.1:
@@ -86,9 +109,13 @@ def fetch_window(topic: str, time_from: str, time_to: str) -> list[dict]:
     )
     resp.raise_for_status()
     data = resp.json()
-    if "Information" in data:
-        print(f"  RATE LIMIT: {data['Information']}")
-        sys.exit(1)
+    # Alpha Vantage segnala il throttling con "Information" o "Note",
+    # gli errori di richiesta con "Error Message". In tutti i casi "feed"
+    # è assente: non vanno trattati come "zero articoli".
+    if "Information" in data or "Note" in data:
+        raise RateLimit(data.get("Information") or data.get("Note"))
+    if "Error Message" in data:
+        raise APIError(data["Error Message"])
     return data.get("feed", [])
 
 
@@ -105,43 +132,71 @@ def build_windows(start: date, end: date) -> list[tuple[date, date]]:
 
 
 def parse_article(item: dict) -> dict:
-    pub = item.get("time_published", "")
+    pub     = item.get("time_published", "")
+    overall = to_float(item.get("overall_sentiment_score"))
     return {
         "date":              f"{pub[0:4]}-{pub[4:6]}-{pub[6:8]}",
         "headline":          item.get("title", "").strip(),
         "summary":           item.get("summary", ""),
         "source":            item.get("source", ""),
         "url":               item.get("url", ""),
-        "overall_sentiment": round(float(item.get("overall_sentiment_score", 0.0)), 3),
-        "overall_label":     av_label(float(item.get("overall_sentiment_score", 0.0))),
+        "overall_sentiment": round(overall, 3),
+        "overall_label":     av_label(overall),
         "topics":            [t["topic"] for t in item.get("topics", [])],
         "all_tickers":       [
             {
                 "ticker":    t.get("ticker"),
-                "sentiment": round(float(t.get("ticker_sentiment_score", 0.0)), 3),
-                "relevance": round(float(t.get("relevance_score",        0.0)), 3),
-                "label":     av_label(float(t.get("ticker_sentiment_score", 0.0))),
+                "sentiment": round(to_float(t.get("ticker_sentiment_score")), 3),
+                "relevance": round(to_float(t.get("relevance_score")), 3),
+                "label":     av_label(to_float(t.get("ticker_sentiment_score"))),
             }
             for t in item.get("ticker_sentiment", [])
         ],
     }
 
 
-def collect_topic(topic: str, start: date, end: date, seen_urls: set) -> tuple[list[dict], int]:
-    """Raccoglie articoli per un topic. Restituisce (nuovi_articoli, chiamate_usate)."""
+def fetch_window_complete(topic: str, w_start: date, w_end: date) -> tuple[list[dict], int]:
+    """Scarica una finestra. Se satura il cap (FEED_CAP articoli) la divide a
+    metà e ricorre, così non si perdono articoli oltre il limite dell'API.
+    La ricorsione si ferma al singolo giorno: se un giorno satura il cap il
+    troncamento è un limite reale dell'API, non un bug nostro.
+    Restituisce (articoli, chiamate_API_usate)."""
+    tf = w_start.strftime("%Y%m%d") + "T0000"
+    tt = w_end.strftime("%Y%m%d")   + "T2359"
+    feed  = fetch_window(topic, tf, tt)
+    calls = 1
+
+    if len(feed) >= FEED_CAP and w_start < w_end:
+        mid = w_start + (w_end - w_start) // 2
+        print(f"\n    ↳ cap {FEED_CAP} su {w_start}→{w_end}, divido", end="", flush=True)
+        time.sleep(1.2)
+        left,  lc = fetch_window_complete(topic, w_start, mid)
+        time.sleep(1.2)
+        right, rc = fetch_window_complete(topic, mid + timedelta(days=1), w_end)
+        return left + right, calls + lc + rc
+
+    if len(feed) >= FEED_CAP:
+        print(f"  ⚠ {w_start} satura il cap {FEED_CAP} — possibile troncamento", end="")
+    return feed, calls
+
+
+def collect_topic(topic: str, start: date, end: date, seen_urls: set, db: dict) -> int:
+    """Raccoglie articoli per un topic, scrivendo in `db` finestra per finestra.
+    `last_updated[topic]` avanza solo dopo che una finestra è stata scaricata
+    interamente: se la raccolta si interrompe (rate limit, rete), il progresso
+    già committato in `db` è coerente e ripartirà senza buchi né sovrapposizioni.
+    Restituisce il numero di chiamate API usate."""
     windows = build_windows(start, end)
     print(f"\n[{topic}] {start} → {end} | {len(windows)} finestre")
 
-    new_articles: list[dict] = []
+    calls_used = 0
+    added = 0
     for i, (w_start, w_end) in enumerate(windows, 1):
         if i > 1:
             time.sleep(1.2)
-        tf = w_start.strftime("%Y%m%d") + "T0000"
-        tt = w_end.strftime("%Y%m%d")   + "T2359"
         print(f"  [{i}/{len(windows)}] {w_start} → {w_end}", end="", flush=True)
-        feed = fetch_window(topic, tf, tt)
-        if len(feed) == 1000:
-            print(f"  ⚠ cap 1000 — considera finestra più corta", end="")
+        feed, calls = fetch_window_complete(topic, w_start, w_end)
+        calls_used += calls
         print(f"  {len(feed)} art")
 
         for item in feed:
@@ -150,10 +205,14 @@ def collect_topic(topic: str, start: date, end: date, seen_urls: set) -> tuple[l
             if not url or not title or url in seen_urls:
                 continue
             seen_urls.add(url)
-            new_articles.append(parse_article(item))
+            db["articles"].append(parse_article(item))
+            added += 1
 
-    print(f"  → {len(new_articles)} nuovi articoli")
-    return new_articles, len(windows)
+        # Finestra completata: avanza il checkpoint del topic.
+        db["last_updated"][topic] = w_end.isoformat()
+
+    print(f"  → {added} nuovi articoli")
+    return calls_used
 
 
 # --- main ---
@@ -196,16 +255,19 @@ def main():
             print(f"\n[{topic}] richiederebbe {calls_needed} call, ne restano {API_CALLS_MAX - calls_used}. Skip.")
             continue
 
-        new_articles, calls = collect_topic(topic, start, end, seen_urls)
-        db["articles"].extend(new_articles)
-        # Aggiorna last_updated solo se la raccolta ha prodotto risultati o
-        # ha completato tutte le finestre senza errori
-        db["last_updated"][topic] = end.isoformat()
-        calls_used += calls
+        try:
+            calls_used += collect_topic(topic, start, end, seen_urls, db)
+        except RateLimit as e:
+            # collect_topic ha già committato in `db` le finestre completate:
+            # salviamo e ci fermiamo senza perdere il lavoro fatto finora.
+            print(f"\nRATE LIMIT: {e}")
+            print("Salvo il progresso e mi fermo — il resto al prossimo run.")
+            break
+        finally:
+            # Persisti dopo ogni topic così un crash non vanifica il budget speso.
+            db["articles"].sort(key=lambda x: x["date"])
+            save_news_db(db)
 
-    # Ordina per data e salva
-    db["articles"].sort(key=lambda x: x["date"])
-    save_news_db(db)
     print(f"\nArticoli totali nel dataset: {len(db['articles'])}")
     print(f"Chiamate API usate: {calls_used}/{API_CALLS_MAX}")
 

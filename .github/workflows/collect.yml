@@ -6,9 +6,18 @@ on:
     - cron: '0 18 * * *'
   workflow_dispatch:  # permette esecuzione manuale dal tab Actions
 
+# Evita che un run schedulato e uno manuale si sovrappongano competendo sul push.
+concurrency:
+  group: data-collection
+  cancel-in-progress: false
+
 jobs:
   collect:
     runs-on: ubuntu-latest
+    # Necessario per il git push: senza, il GITHUB_TOKEN è read-only sui repo
+    # con i default recenti e il push fallirebbe con 403.
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -26,18 +35,42 @@ jobs:
       - name: Install dependencies
         run: pip install -r pipeline/requirements.txt
 
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # News e prezzi sono committati separatamente: un fallimento dei prezzi
+      # non deve far perdere le news già raccolte (budget Alpha Vantage 25/giorno).
       - name: Collect news + sentiment (Alpha Vantage)
         env:
           ALPHAVANTAGE_KEY: ${{ secrets.ALPHAVANTAGE_KEY }}
         run: python pipeline/classify_news.py
 
+      - name: Commit news
+        if: always()  # committa anche il progresso parziale se la raccolta crasha
+        run: |
+          git add -f pipeline/data/news.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "Nessuna modifica alle news."
+          else
+            git commit -m "data: news update $(date -u +%Y-%m-%d)"
+            git pull --rebase --autostash origin main
+            git push
+          fi
+
       - name: Fetch prices (yfinance)
+        if: always()  # i prezzi vanno scaricati anche se la raccolta news è fallita
         run: python pipeline/fetch_prices.py
 
-      - name: Commit updated data
+      - name: Commit prices
+        if: always()
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f pipeline/data/news.json pipeline/data/*/prices.json pipeline/tickers.json 2>/dev/null || true
-          git diff --cached --quiet || git commit -m "data: daily update $(date -u +%Y-%m-%d)"
-          git push
+          git add -f pipeline/data/*/prices.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "Nessuna modifica ai prezzi."
+          else
+            git commit -m "data: prices update $(date -u +%Y-%m-%d)"
+            git pull --rebase --autostash origin main
+            git push
+          fi

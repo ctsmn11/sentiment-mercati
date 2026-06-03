@@ -11,6 +11,8 @@ Usage:
 
 import argparse
 import json
+import os
+import sys
 from datetime import date, timedelta
 
 import yfinance as yf
@@ -20,6 +22,15 @@ from utils import DATASET_START, all_tickers, load_tickers_config, ticker_data_d
 TICKER_ALIASES = {
     "^VWCE": "VWCE.AS",
 }
+
+
+def to_yfinance_symbol(ticker: str) -> str:
+    """Converte un ticker nel simbolo atteso da Yahoo Finance.
+    Yahoo usa il trattino al posto del punto per le classi di azioni
+    (es. BRK.B → BRK-B); gli alias espliciti hanno la precedenza."""
+    if ticker in TICKER_ALIASES:
+        return TICKER_ALIASES[ticker]
+    return ticker.replace(".", "-")
 
 
 # --- funzioni di I/O ---
@@ -40,8 +51,13 @@ def save_prices(ticker: str, prices: list[dict], version: str):
         "dataset_version": version,
         "prices":          with_returns(prices),
     }
-    with open(d / "prices.json", "w", encoding="utf-8") as f:
+    # Scrittura atomica: temp + rename, così un'interruzione a metà scrittura
+    # non lascia un prices.json troncato (che verrebbe committato dal CI).
+    dst = d / "prices.json"
+    tmp = dst.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, dst)
 
 
 # --- funzioni di calcolo ---
@@ -70,7 +86,7 @@ def dedup_by_date(prices: list[dict]) -> list[dict]:
 # --- funzione API ---
 
 def fetch_from_yfinance(ticker: str, start: date, end: date) -> list[dict]:
-    yf_ticker = TICKER_ALIASES.get(ticker, ticker)
+    yf_ticker = to_yfinance_symbol(ticker)
     end_excl  = (end + timedelta(days=1)).isoformat()
     df = yf.Ticker(yf_ticker).history(start=start.isoformat(), end=end_excl, auto_adjust=True)
     if df.empty:
@@ -94,6 +110,8 @@ def main():
 
     tickers_to_run = [args.ticker] if args.ticker else all_tickers(config)
 
+    attempted = 0  # ticker che avevano giorni da scaricare
+    failed    = []
     for ticker in tickers_to_run:
         existing = load_existing_prices(ticker)
         start    = date.fromisoformat(existing[-1]["date"]) + timedelta(days=1) if existing else DATASET_START
@@ -102,8 +120,16 @@ def main():
             print(f"[{ticker}] prezzi già aggiornati, skip.")
             continue
 
+        attempted += 1
         print(f"[{ticker}] {start} → {end}...", end=" ", flush=True)
-        new_prices = fetch_from_yfinance(ticker, start, end)
+        # Un fallimento di yfinance su un ticker (rete, throttling Yahoo) non
+        # deve abortire l'intero run: isoliamo l'errore e proseguiamo.
+        try:
+            new_prices = fetch_from_yfinance(ticker, start, end)
+        except Exception as e:
+            print(f"ERRORE: {e}")
+            failed.append(ticker)
+            continue
 
         if not new_prices:
             print("nessun dato.")
@@ -112,6 +138,14 @@ def main():
         all_prices = dedup_by_date(existing + new_prices)
         save_prices(ticker, all_prices, version)
         print(f"{len(new_prices)} giorni aggiunti (totale: {len(all_prices)})")
+
+    if failed:
+        print(f"\n⚠ {len(failed)}/{attempted} ticker falliti: {', '.join(failed)}")
+    # Esci con errore solo se TUTTO è fallito (probabile outage sistemico):
+    # i fallimenti parziali lasciano comunque dati validi da committare.
+    if attempted and len(failed) == attempted:
+        print("Tutti i ticker hanno fallito — esco con errore.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
