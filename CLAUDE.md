@@ -14,7 +14,7 @@ Granger causality test (100 days, S&P 500) shows:
 - **Market → News**: significant at all lags 1–5 (p < 0.025)
 - **News → Market**: not significant at any lag (p > 0.18)
 
-Conclusion: price movements precede news sentiment, not the reverse. Journalists react to the market, not the other way around.
+Conclusion: price movements precede news sentiment, not the reverse.
 
 ## Development Phases
 
@@ -32,39 +32,47 @@ Conclusion: price movements precede news sentiment, not the reverse. Journalists
 - **Prices**: `yfinance`
 - **Statistics**: `scipy` (Pearson), `statsmodels` (Granger)
 
-## Commands
+## Two Pipeline Variants
 
-### First-time setup
+There are two separate pipeline directories with different purposes:
 
-```bat
-cd backend
+### `pipeline/` — Production (GitHub Actions)
+
+Used by the daily CI job (`collect.yml`). Handles **50 S&P 500 tickers** + `^GSPC` index defined in `pipeline/tickers.json`. Writes data **committed to the repo** at `pipeline/data/`.
+
+```bash
+cd pipeline
 pip install -r requirements.txt
-```
 
-```bash
-cd frontend
-npm install
-```
+# Collect news + sentiment (processes tickers by staleness, respects 25 req/day budget)
+python classify_news.py
 
-### Pipeline (run before starting the server)
-
-```bash
-cd backend
-
-# 1. Scarica news + sentiment da Alpha Vantage (usa ~13 chiamate API per 365 giorni)
-python classify_news.py --days 365
-
-# 2. Scarica prezzi storici da Yahoo Finance
+# Download prices for all tickers
 python fetch_prices.py
 
-# 3. Calcola correlazione Pearson + Granger
-python compute_correlation.py
-
-# (opzionale) Valida la qualita' del dato
-python validate_news.py
+# Quarterly: sync tickers.json with current SPDR top-50 holdings
+python update_tickers.py
 ```
 
-### Dev server (two terminals)
+Data layout:
+- `pipeline/data/news.json` — all articles across all tickers, deduped by URL, with `last_updated` checkpoint per ticker
+- `pipeline/data/{TICKER}/prices.json` — per-ticker OHLCV + daily returns
+
+### `backend/` — Local dev (single ticker)
+
+Used for local development. Handles one ticker at a time from `backend/.env`. Writes to `backend/data/` (git-ignored).
+
+```bash
+cd backend
+pip install -r requirements.txt
+
+python classify_news.py --days 365   # ~13 API calls
+python fetch_prices.py
+python compute_correlation.py
+python validate_news.py              # optional quality report
+```
+
+### Dev server
 
 ```bash
 # Terminal 1 — backend
@@ -76,65 +84,84 @@ cd frontend
 npm run dev
 ```
 
+After running the local pipeline, copy the data files to the frontend's public dir:
+
+```bash
+cd frontend
+npm run sync-data   # cp ../backend/data/*.json public/data/
+```
+
 Open http://localhost:5173.
 
 ### Environment
 
 Create `backend/.env` (see `.env.example`):
 ```
-ALPHAVANTAGE_KEY=...   # gratis su alphavantage.co
+ALPHAVANTAGE_KEY=...
 TICKER=^GSPC
 ```
 
 ## Architecture
 
 ```
-[Alpha Vantage NEWS_SENTIMENT API]
+[GitHub Actions: collect.yml — daily 18:00 UTC]
         |
         v
-[classify_news.py]
-  - fetches news in 30-day windows (rate limit: 1 req/s, 25/day)
-  - uses ticker_sentiment_score as relevance-weighted sentiment
-  - writes data/news_raw.json + data/news_classified.json
+[pipeline/classify_news.py]
+  - iterates tickers by staleness (most stale first)
+  - 30-day windows, 1 API call/window, max 25/day
+  - dedup by URL across all tickers
+  - checkpoint advances per window (atomic writes)
+  - writes pipeline/data/news.json
         |
         v
-[fetch_prices.py]
-  - downloads OHLCV from Yahoo Finance for the same date range
-  - writes data/prices.json
+[pipeline/fetch_prices.py]
+  - incremental: appends only missing days
+  - atomic write (tmp + rename) to prevent corrupt JSON on CI kill
+  - writes pipeline/data/{TICKER}/prices.json (includes daily returns)
+        |
+[Committed to repo]
         |
         v
-[compute_correlation.py]
-  - aggregates daily sentiment = mean(sentiment * relevance)
-  - computes daily returns = (close_t - close_{t-1}) / close_{t-1}
-  - Pearson correlation for lag -5..+5
-  - Granger causality test (both directions, maxlag=5)
-  - writes data/correlations.json
-        |
-        v
-[main.py + FastAPI /api/data]
-  - reads news_classified.json + fetches prices on demand
+[backend/main.py + FastAPI /api/data]
+  - reads backend/data/news_classified.json
+  - fetches prices live from yfinance
+  - in-process cache (_cache) — cleared on server restart
   - serves { news, prices } to the frontend
         |
         v
-[Frontend: MarketChart + NewsPanel]
+[frontend: useDashboardData.js]
+  - fetches /data/news_classified.json, /data/prices.json, /data/correlations.json
+    from frontend/public/data/ (static files, not the API)
+  - exposes { data, loading, error }
+        |
+        v
+[MarketChart + CorrelationChart + GrangerPanel + NewsPanel]
 ```
+
+Note: `useSentimentData.js` is a legacy hook that calls `/api/data`; it is not used by `App.jsx`.
 
 ## Key Files
 
 | File | Responsibility |
 |------|---------------|
-| `backend/classify_news.py` | Fetch news + sentiment from Alpha Vantage, write `news_classified.json` |
-| `backend/fetch_prices.py` | Download price history from Yahoo Finance, write `prices.json` |
-| `backend/compute_correlation.py` | Pearson lag analysis + Granger causality test, write `correlations.json` |
-| `backend/validate_news.py` | One-off qualitative data validation report |
-| `backend/main.py` | FastAPI server — reads `news_classified.json`, serves `/api/data` |
-| `frontend/src/hooks/useSentimentData.js` | Fetches `/api/data`, exposes `{ news, prices, loading, error }` |
-| `frontend/src/components/MarketChart.jsx` | Dual-axis Recharts chart (price line + sentiment bars) |
+| `pipeline/classify_news.py` | Multi-ticker news collection, checkpoint-based, URL-deduped |
+| `pipeline/fetch_prices.py` | Incremental per-ticker price download |
+| `pipeline/update_tickers.py` | Quarterly sync of `tickers.json` with SPDR top-50 |
+| `pipeline/utils.py` | Shared constants: `DATASET_START` (2026-01-01), file paths, `all_tickers()` |
+| `pipeline/tickers.json` | 50 S&P 500 constituents + `^GSPC` market index |
+| `backend/classify_news.py` | Single-ticker news fetch for local dev |
+| `backend/compute_correlation.py` | Pearson lag analysis + Granger causality test → `correlations.json` |
+| `backend/main.py` | FastAPI server with in-process cache, `TICKER_ALIASES` for `^VWCE` |
+| `frontend/src/hooks/useDashboardData.js` | Loads static JSON from `public/data/`, exposes `{ data, loading, error }` |
+| `frontend/src/components/MarketChart.jsx` | Dual-axis chart: price line + daily sentiment bars + tooltip with headlines |
+| `frontend/src/components/CorrelationChart.jsx` | Pearson r bar chart for lag −5…+5, highlights significant bars |
+| `frontend/src/components/GrangerPanel.jsx` | F-stat/p-value table for both Granger directions + conclusion text |
 | `frontend/src/components/NewsPanel.jsx` | Sorted list of headlines with sentiment badge and score |
 
 ## Sentiment Score
 
-Alpha Vantage provides `ticker_sentiment_score` in range [−1, +1].
+Alpha Vantage provides `ticker_sentiment_score` in [−1, +1].
 
 Effective daily score: `mean(sentiment * relevance)` across all articles for that day.
 
@@ -142,12 +169,15 @@ Thresholds: `score > 0.1` → positive, `score < -0.1` → negative, else neutra
 
 ## Data Quality Notes
 
-- Coverage is sparse before Oct 2025 (1–4 articles/month); denser from Oct 2025 onward
-- Alpha Vantage occasionally assigns high relevance to tangential articles (e.g., personal finance pieces that mention SPY indirectly)
-- Granger results are robust to the ~2–3 low-quality articles identified in validation
+- `DATASET_START = 2026-01-01` in `pipeline/utils.py` — data before that date is not collected
+- Coverage is sparse before Oct 2025 in the `backend/` local data (1–4 articles/month)
+- Alpha Vantage `^GSPC` news requires using `SPY` as proxy (mapped in `NEWS_TICKER_ALIASES`)
+- `^VWCE` requires Yahoo Finance alias `VWCE.AS` (mapped in `TICKER_ALIASES` in `main.py` and `fetch_prices.py`)
+- When Alpha Vantage returns ≥1000 articles in a window, the checkpoint advances only to the last article date (not the window end), so the next run resumes without gaps
 
 ## Important Notes
 
 - **CORS**: backend allows only `http://localhost:5173`; update if deploying
-- **Rate limit**: Alpha Vantage free tier = 25 req/day, 1 req/s. The pipeline uses ~13 calls for 365 days
-- **Data files**: `backend/data/` is git-ignored — regenerate with the pipeline commands above
+- **Rate limit**: Alpha Vantage free tier = 25 req/day. `pipeline/classify_news.py` tracks budget across tickers; partial progress is saved after every window
+- **Atomic writes**: both pipeline scripts write to a `.json.tmp` then rename — prevents corrupt JSON if the CI job is killed mid-write
+- **Data files**: `backend/data/` is git-ignored; `pipeline/data/` is committed to the repo by the CI job
