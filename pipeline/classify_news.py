@@ -42,7 +42,8 @@ import requests
 from dotenv import load_dotenv
 
 from utils import (
-    DATASET_START, DATA_DIR, NEWS_F, all_tickers, load_tickers_config
+    DATASET_START, NEWS_BLOB, all_tickers, load_tickers_config,
+    gcs_download_json, gcs_upload_json,
 )
 
 # Su Windows la console di default è cp1252 e va in errore sui caratteri non
@@ -80,21 +81,16 @@ def to_av_symbol(ticker: str) -> str:
 # --- funzioni di I/O ---
 
 def load_news_db() -> dict:
-    if not NEWS_F.exists():
-        return {"last_updated": {}, "articles": []}
-    with open(NEWS_F, encoding="utf-8") as f:
-        return json.load(f)
+    db = gcs_download_json(NEWS_BLOB, default={"last_updated": {}, "articles": []})
+    db.setdefault("last_updated", {})
+    db.setdefault("articles", [])
+    return db
 
 
 def save_news_db(db: dict):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    # Scrittura atomica: scrivo su un file temporaneo e poi lo rinomino.
-    # Se il processo viene ucciso a metà scrittura (timeout CI, OOM) il file
-    # definitivo resta intatto e non viene committato un JSON troncato.
-    tmp = NEWS_F.with_suffix(".json.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, NEWS_F)
+    # L'upload su GCS è atomico: il blob precedente resta leggibile
+    # fino al completamento dell'upload, senza rischio di file troncati.
+    gcs_upload_json(NEWS_BLOB, db)
 
 
 def last_collected_date(ticker: str, db: dict) -> date:

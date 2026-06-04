@@ -11,13 +11,15 @@ Usage:
 
 import argparse
 import json
-import os
 import sys
 from datetime import date, timedelta
 
 import yfinance as yf
 
-from utils import DATASET_START, all_tickers, load_tickers_config, ticker_data_dir
+from utils import (
+    DATASET_START, all_tickers, load_tickers_config,
+    prices_blob, gcs_download_json, gcs_upload_json,
+)
 
 # Su Windows la console di default è cp1252 e va in errore sui caratteri non
 # ASCII (→, ⚠) usati nei log; su CI lo stdout è già UTF-8 e questo è un no-op.
@@ -43,28 +45,17 @@ def to_yfinance_symbol(ticker: str) -> str:
 # --- funzioni di I/O ---
 
 def load_existing_prices(ticker: str) -> list[dict]:
-    path = ticker_data_dir(ticker) / "prices.json"
-    if not path.exists():
-        return []
-    with open(path, encoding="utf-8") as f:
-        return json.load(f).get("prices", [])
+    data = gcs_download_json(prices_blob(ticker), default={})
+    return data.get("prices", [])
 
 
 def save_prices(ticker: str, prices: list[dict], version: str):
-    d = ticker_data_dir(ticker)
-    d.mkdir(parents=True, exist_ok=True)
     out = {
         "ticker":          ticker,
         "dataset_version": version,
         "prices":          with_returns(prices),
     }
-    # Scrittura atomica: temp + rename, così un'interruzione a metà scrittura
-    # non lascia un prices.json troncato (che verrebbe committato dal CI).
-    dst = d / "prices.json"
-    tmp = dst.with_suffix(".json.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, dst)
+    gcs_upload_json(prices_blob(ticker), out)
 
 
 # --- funzioni di calcolo ---

@@ -15,6 +15,7 @@ pipeline/data/
 # Secrets
 backend/.env
 pipeline/.env
+progetti-personali-cloud*.json
 
 # Build frontend
 frontend/dist/
