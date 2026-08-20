@@ -20,6 +20,9 @@ progetti-personali-cloud*.json
 # Build frontend
 frontend/dist/
 
+# Generated build and analysis reports
+artifacts/
+
 # Claude Code internal
 .claude/
 

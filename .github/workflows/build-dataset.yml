@@ -1,0 +1,84 @@
+name: Build analytical dataset
+
+on:
+  workflow_dispatch:
+    inputs:
+      as_of:
+        description: Inclusive snapshot date (YYYY-MM-DD)
+        required: true
+        type: string
+      dataset_version:
+        description: Optional version override (defaults to date + commit SHA)
+        required: false
+        type: string
+      dry_run:
+        description: Validate and report without publishing to BigQuery
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: analytical-dataset-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: pipeline/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r pipeline/requirements.txt
+
+      - name: Run dataset builder tests
+        run: python -m unittest discover -s pipeline/tests -v
+
+      - name: Build dataset snapshot
+        shell: bash
+        env:
+          GCS_BUCKET: sentiment-mercati-data
+          BQ_DATASET: sentiment_mercati
+          BQ_LOCATION: EU
+          INPUT_AS_OF: ${{ inputs.as_of }}
+          INPUT_DATASET_VERSION: ${{ inputs.dataset_version }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          args=(
+            --as-of "$INPUT_AS_OF"
+            --git-commit "${{ github.sha }}"
+            --report-dir artifacts/dataset-build
+          )
+
+          if [[ -n "$INPUT_DATASET_VERSION" ]]; then
+            args+=(--dataset-version "$INPUT_DATASET_VERSION")
+          fi
+
+          if [[ "$INPUT_DRY_RUN" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+
+          python pipeline/build_dataset.py "${args[@]}"
+
+      - name: Upload quality report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dataset-build-${{ github.run_id }}
+          path: artifacts/dataset-build/
+          if-no-files-found: warn
